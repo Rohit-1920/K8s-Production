@@ -1,12 +1,15 @@
 <div align="center">
 
-# Production-Grade AWS EKS: From VPC Design to a Highly Available, Scalable Application
+# EKS Deep-Dive Reference: VPC Design to a Highly Available, Scalable Application
 
-**A hands-on engineering handbook for designing, provisioning, securing, scaling, breaking, and operating Amazon EKS in `ap-south-1` (Mumbai).**
+**The long-form companion to the beginner guide in [README.md](README.md).**
 
 Custom VPC · Private worker nodes · Terraform · Managed node groups · ALB via AWS Load Balancer Controller · HPA and node autoscaling · EKS Pod Identity · Observability · Failure testing · Disaster recovery
 
 </div>
+
+> [!TIP]
+> **New to Kubernetes or EKS? Start with [README.md](README.md).** It is the short, step-by-step path. This file is the reference you open *afterwards* when you want to know why a design choice was made, how something fails, or what a senior engineer would check before approving it. You do not need to read it top to bottom.
 
 This guide takes you from an empty AWS account to a multi-AZ EKS cluster serving an HTTPS application through an Application Load Balancer, with worker nodes and pods kept private. Every major step explains the concept first, then the implementation, then how to verify it, how it fails, and what a senior engineer would check before approving it.
 
@@ -61,15 +64,15 @@ This guide takes you from an empty AWS account to a multi-AZ EKS cluster serving
 **Implementation roadmap**
 
 ```mermaid
-flowchart LR
-  A["1. Tooling and<br/>AWS access"] --> B["2. Terraform<br/>VPC, routing, NAT"]
-  B --> C["3. EKS cluster<br/>and node groups"]
-  C --> D["4. Verify nodes,<br/>CNI, CoreDNS"]
-  D --> E["5. Push image<br/>to ECR, deploy app"]
-  E --> F["6. AWS Load Balancer<br/>Controller"]
-  F --> G["7. Ingress, ACM,<br/>DNS, HTTPS"]
-  G --> H["8. HPA and node<br/>autoscaling"]
-  H --> I["9. Harden, observe,<br/>break it on purpose"]
+flowchart TD
+  A["1. Tooling and AWS access"] --> B["2. Terraform: VPC, routing, NAT"]
+  B --> C["3. EKS cluster and node groups"]
+  C --> D["4. Verify nodes, CNI, CoreDNS"]
+  D --> E["5. Push image to ECR, deploy app"]
+  E --> F["6. AWS Load Balancer Controller"]
+  F --> G["7. Ingress, ACM, DNS, HTTPS"]
+  G --> H["8. HPA and node autoscaling"]
+  H --> I["9. Harden, observe, break it on purpose"]
   I --> J["10. Tear down"]
 ```
 
@@ -116,7 +119,7 @@ Mixing provisioning tools is the most common source of confusing drift. This gui
 
 | Component | Assumption in this guide | How to verify before you start |
 |---|---|---|
-| Amazon EKS / Kubernetes | **1.35** (standard support until 27 March 2027 per the EKS version calendar I could verify) | `aws eks describe-cluster-versions` and the [EKS version calendar](https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html). A newer version may exist; EKS upgrades one minor version at a time. |
+| Amazon EKS / Kubernetes | **1.35** (standard support until 27 March 2027 per the EKS version calendar I could verify) | `aws eks describe-cluster-versions` and the [EKS version calendar](https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html). AWS documentation lists **1.36 and 1.35** as the versions currently in standard support (checked 16 October 2026), so 1.36 is also a valid choice; EKS upgrades one minor version at a time. |
 | Terraform AWS provider | `~> 6.0` | [Provider registry](https://registry.terraform.io/providers/hashicorp/aws/latest) |
 | Terraform EKS module | `terraform-aws-modules/eks/aws` **`~> 21.0`** (uses `name`, `kubernetes_version`, `endpoint_public_access`, `enabled_log_types`; these differ from v20 and earlier) | [Module docs](https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest) and [v20 to v21 upgrade guide](https://github.com/terraform-aws-modules/terraform-aws-eks/blob/master/docs/UPGRADE-21.0.md) |
 | AWS Load Balancer Controller | **Not pinned blindly.** Chart and app versions move; the IAM policy must match the app version. | Section 12 shows how to read the chart's `APP VERSION` and fetch the matching IAM policy |
@@ -276,126 +279,53 @@ Every later section follows this one design. Decisions are listed first so you c
 
 ### Reference architecture diagram
 
+**Diagram A - the traffic path**
+
 ```mermaid
 flowchart TB
-  client["Internet clients"]
-  r53["Route 53<br/>DOMAIN_NAME alias to ALB"]
+  client["Internet clients"] -->|"HTTPS 443"| igw["Internet gateway"]
+  igw --> alb["ALB nodes - public subnets"]
+  alb -->|"IP targets"| pods["Worker nodes and pods - private subnets"]
+  pods -->|"egress only"| nat["NAT gateways - public subnets"]
+  nat --> out["Internet - outbound only"]
+  pods -.->|"image pulls"| ecr["Amazon ECR and S3"]
+  pods -.->|"logs and metrics"| cw["CloudWatch"]
+  alb -.-> acm["ACM certificate for TLS"]
 
-  subgraph AWSM["AWS-managed services - outside your VPC"]
-    subgraph CP["EKS control plane - AWS-owned infrastructure, multi-AZ"]
-      api["Kubernetes API servers"]
-      etcd["etcd and core controllers"]
-    end
-    acm["ACM certificate"]
-    elbapi["Elastic Load Balancing API"]
-    ecr["Amazon ECR"]
-    s3["S3 - ECR layer storage"]
-    cw["CloudWatch Logs and metrics"]
-  end
+  classDef vpcres fill:#0c2a4a,stroke:#60a5fa,color:#dbeafe
+  classDef awsm fill:#1f2937,stroke:#9ca3af,color:#e5e7eb
+  classDef ctrl fill:#052e16,stroke:#4ade80,color:#dcfce7
+  class igw,nat,pods vpcres
+  class acm,ecr,cw,out awsm
+  class alb ctrl
+```
 
-  subgraph VPC["Your VPC 10.0.0.0/16 - ap-south-1"]
-    igw["Internet gateway"]
-    vpce["Optional VPC endpoints<br/>ecr.api, ecr.dkr, sts, logs, S3 gateway"]
+**Diagram B - the control path**
 
-    subgraph AZA["AZ ap-south-1a"]
-      subgraph PUBA["Public subnet 10.0.0.0/24"]
-        albA["ALB node"]
-        natA["NAT gateway A"]
-      end
-      subgraph PRIVA["Private subnet 10.0.16.0/20"]
-        nodeA["Worker node<br/>managed node group ng-a"]
-        podA["App pods + aws-node CNI"]
-        lbc["AWS Load Balancer Controller"]
-        eniA["EKS cross-account ENI"]
-      end
-      subgraph DBA["Isolated DB subnet 10.0.64.0/24 - future"]
-        dbA["Database tier"]
-      end
-    end
+```mermaid
+flowchart TB
+  lbc["AWS Load Balancer Controller<br/>runs in private subnets"] -->|"watches Ingress and Services"| cp["EKS control plane<br/>AWS-managed, multi-AZ"]
+  lbc -->|"creates and updates"| elbapi["Elastic Load Balancing API"]
+  elbapi -.->|"provisions"| alb["ALB - public subnets"]
+  kubelet["Worker node kubelet"] -->|"via cross-account ENIs"| cp
+  vpce["Optional VPC endpoints"] -.-> ecr["Amazon ECR"]
+  db["Isolated DB subnets - future"]
 
-    subgraph AZB["AZ ap-south-1b"]
-      subgraph PUBB["Public subnet 10.0.1.0/24"]
-        albB["ALB node"]
-        natB["NAT gateway B"]
-      end
-      subgraph PRIVB["Private subnet 10.0.32.0/20"]
-        nodeB["Worker node<br/>managed node group ng-b"]
-        podB["App pods + aws-node CNI"]
-        eniB["EKS cross-account ENI"]
-      end
-      subgraph DBB["Isolated DB subnet 10.0.65.0/24 - future"]
-        dbB["Database tier"]
-      end
-    end
-
-    subgraph AZC["AZ ap-south-1c"]
-      subgraph PUBC["Public subnet 10.0.2.0/24"]
-        albC["ALB node"]
-        natC["NAT gateway C"]
-      end
-      subgraph PRIVC["Private subnet 10.0.48.0/20"]
-        nodeC["Worker node<br/>managed node group ng-c"]
-        podC["App pods + aws-node CNI"]
-        eniC["EKS cross-account ENI"]
-      end
-      subgraph DBC["Isolated DB subnet 10.0.66.0/24 - future"]
-        dbC["Database tier"]
-      end
-    end
-  end
-
-  client -->|"1 DNS lookup"| r53
-  client -->|"2 HTTPS 443"| igw
-  igw --> albA
-  igw --> albB
-  igw --> albC
-  albA -->|"IP targets"| podA
-  albB -->|"IP targets"| podB
-  albC -->|"IP targets"| podC
-  albA -.-> acm
-
-  nodeA -->|"egress"| natA
-  nodeB -->|"egress"| natB
-  nodeC -->|"egress"| natC
-  natA --> igw
-  natB --> igw
-  natC --> igw
-
-  nodeA -->|"kubelet to API"| eniA
-  nodeB --> eniB
-  nodeC --> eniC
-  eniA --> api
-  eniB --> api
-  eniC --> api
-  api --- etcd
-
-  lbc -->|"watch Ingress and Services"| api
-  lbc -->|"create and update ALB, listeners, target groups"| elbapi
-  elbapi -.->|"provisions"| albA
-  elbapi -.->|"provisions"| albB
-  elbapi -.->|"provisions"| albC
-
-  nodeA -.->|"image pull via NAT or endpoints"| ecr
-  ecr -.-> s3
-  nodeA -.-> vpce
-  vpce -.-> ecr
-  nodeA -.->|"logs and metrics"| cw
-
-  classDef cp fill:#2e1065,stroke:#a78bfa,color:#ede9fe
-  classDef vpc fill:#0c2a4a,stroke:#60a5fa,color:#dbeafe
-  classDef aws fill:#1f2937,stroke:#9ca3af,color:#e5e7eb
+  classDef plane fill:#2e1065,stroke:#a78bfa,color:#ede9fe
+  classDef vpcres fill:#0c2a4a,stroke:#60a5fa,color:#dbeafe
+  classDef awsm fill:#1f2937,stroke:#9ca3af,color:#e5e7eb
   classDef ctrl fill:#052e16,stroke:#4ade80,color:#dcfce7
   classDef opt fill:#1f2937,stroke:#fbbf24,color:#fef3c7,stroke-dasharray:5 5
-
-  class api,etcd cp
-  class igw,natA,natB,natC,nodeA,nodeB,nodeC,podA,podB,podC,lbc,eniA,eniB,eniC vpc
-  class r53,acm,elbapi,ecr,s3,cw aws
-  class albA,albB,albC ctrl
-  class vpce,dbA,dbB,dbC opt
+  class cp plane
+  class lbc,kubelet vpcres
+  class elbapi,ecr awsm
+  class alb ctrl
+  class vpce,db opt
 ```
 
 **How to read it**
 
+- The pictures draw each tier **once**. In the real design every subnet tier exists in all three AZs (see the CIDR table in [Section 4.1](#41-cidr-allocation-plan) and the per-AZ node groups in Section 8).
 - The **ALB nodes (green)** sit in public subnets but are *created and reconciled by the AWS Load Balancer Controller* (running in your cluster) calling the Elastic Load Balancing API. They are not Terraform resources in this guide.
 - The **control plane (purple)** is not an EC2 instance in your subnets. EKS places **cross-account ENIs** in your subnets so the kubelet on each node can reach the API servers and the API servers can reach kubelets (for `exec`, `logs`, webhooks).
 - **Dashed items** are optional: database tier (future) and VPC endpoints (reduce NAT dependence; see [Section 5](#5-public-private-and-isolated-subnets)).
