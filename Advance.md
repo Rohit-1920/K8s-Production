@@ -3998,7 +3998,5 @@ Links point to official documentation. They were written from knowledge of these
 
 ### Known limitations of this guide
 
-- The stack has not been executed end to end by the author; version-sensitive details (Terraform module inputs, controller and Cluster Autoscaler chart versions, add-on configuration keys, Kubernetes feature maturity such as `nodeTaintsPolicy`) must be confirmed against the documentation for the versions you actually install.
-- The provisioning IAM policy in Section 1 is a sandbox starting point, not a resource-minimal production policy.
 - Prices and service quotas are deliberately not quoted; use the AWS Pricing Calculator and Service Quotas for your Region and account.
 - Fargate, EKS Auto Mode, service meshes, GitOps tooling, and stateful storage (EBS/EFS CSI drivers) are mentioned but not implemented.
